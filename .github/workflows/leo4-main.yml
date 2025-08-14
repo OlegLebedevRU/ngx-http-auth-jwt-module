@@ -1,0 +1,176 @@
+name: Make Releases
+
+on:
+  workflow_dispatch:
+
+jobs:
+  meta:
+    name: Get Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{steps.meta.outputs.tag}}
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Metadata
+        id: meta
+        run: |
+          set -eu
+          tag=$(git describe --tags --abbrev=0)
+
+          echo "tag=${tag}" >> $GITHUB_OUTPUT
+
+  build:
+    name: "NGINX: ${{ matrix.nginx-version }}; libjwt: ${{ matrix.libjwt-version }}"
+    needs: meta
+    strategy:
+      matrix:
+        nginx-version:
+          - 1.26.3 # stable
+          - 1.27.3 # mainline
+          - 1.27.4 # mainline
+
+        libjwt-version:
+          - 1.15.3
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        path: ngx-http-auth-jwt-module
+
+    - name: Get Metadata
+      id: meta
+      run: |
+        set -eu
+        artifact="ngx-http-auth-jwt-module-${{needs.meta.outputs.tag}}_libjwt-${{matrix.libjwt-version}}_nginx-${{matrix.nginx-version}}"
+        
+        echo "artifact=${artifact}" >> $GITHUB_OUTPUT
+        echo "filename=${artifact}.tgz" >> $GITHUB_OUTPUT
+
+
+    # TODO cache the build result so we don't have to do this every time?
+    - name: Download jansson
+      uses: actions/checkout@v4
+      with:
+        repository: 'akheron/jansson'
+        ref: 'v2.14'
+        path: 'jansson'
+
+    - name: Build jansson
+      working-directory: ./jansson
+      run: |
+        set -e
+        cmake . -DJANSSON_BUILD_SHARED_LIBS=1 -DJANSSON_BUILD_DOCS=OFF
+        make
+        make check
+        sudo make install
+
+    # TODO cache the build result so we don't have to do this every time?
+    - name: Download libjwt
+      uses: actions/checkout@v4
+      with:
+        repository: 'benmcollins/libjwt'
+        ref: 'v${{matrix.libjwt-version}}'
+        path: 'libjwt'
+
+    - name: Build libjwt
+      working-directory: ./libjwt
+      run: |
+        set -e
+        autoreconf -i
+        ./configure
+        make all
+        sudo make install
+
+    - name: Download NGINX
+      run: | 
+        mkdir nginx
+        curl -O http://nginx.org/download/nginx-${{matrix.nginx-version}}.tar.gz
+        tar -xzf nginx-${{matrix.nginx-version}}.tar.gz --strip-components 1 -C nginx
+
+    - name: Configure NGINX
+      working-directory: ./nginx
+      run: |
+        BUILD_FLAGS=''
+        MAJ=$(echo ${{matrix.nginx-version}} | cut -f1 -d.)
+        MIN=$(echo ${{matrix.nginx-version}} | cut -f2 -d.)
+        REV=$(echo ${{matrix.nginx-version}} | cut -f3 -d.)
+        
+        if [ "${MAJ}" -gt 1 ] || [ "${MAJ}" -eq 1 -a "${MIN}" -ge 23 ]; then
+          BUILD_FLAGS="${BUILD_FLAGS} --with-cc-opt='-DNGX_LINKED_LIST_COOKIES=1'"
+        fi
+        
+        ./configure --with-compat --without-http_rewrite_module --add-dynamic-module=../ngx-http-auth-jwt-module ${BUILD_FLAGS}
+
+    - name: Make Modules
+      working-directory: ./nginx
+      run: make modules
+
+    - name: Create Release Archive
+      run: |
+        cp ./nginx/objs/ngx_http_auth_jwt_module.so ./
+        tar czf ${{steps.meta.outputs.filename}} ngx_http_auth_jwt_module.so
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        if-no-files-found: error
+        name: ${{steps.meta.outputs.artifact}}
+        path: ${{steps.meta.outputs.filename}}
+
+  release:
+    name: Create/Update Release
+    needs:
+      - meta
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+
+      - name: Set-up Variables
+        id: vars
+        run: |
+          echo "date_now=$(date --rfc-3339=seconds)" >> "${GITHUB_OUTPUT}"
+          
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten Artifacts
+        run: |
+          set -eu
+          
+          cd artifacts
+
+          for f in $(find . -type f); do
+            echo "Staging: ${f}"
+            mv "${f}" .
+          done
+
+          find . -type d -mindepth 1 -exec rm -rf "{}" +
+
+      - name: Create/Update Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{needs.meta.outputs.tag}}
+          name: "Pre-release: ${{needs.meta.outputs.tag}}"
+          body: |
+            > [!WARNING]
+            > This is an automatically generated pre-release version of the module, which includes the latest master branch changes.
+            > Please report any bugs you find.
+
+            - Build Date: `${{ steps.vars.outputs.date_now }}`
+            - Commit: `${{ github.sha }}`
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: artifacts/*
