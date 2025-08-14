@@ -58,7 +58,7 @@ http {
     }
 }
 `
-
+# if .conf is fix in layer, but need existe valid upstream
 #RUN nginx -t
 
 WORKDIR /
